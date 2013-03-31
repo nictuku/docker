@@ -834,10 +834,6 @@ func (srv *Server) CmdAttach(stdin io.ReadCloser, stdout io.Writer, args ...stri
 // Examples: 8881, udp/8882.
 type PortList []Port
 
-func (ports PortList) String() string {
-	return fmt.Sprint(ports)
-}
-
 func (ports PortList) Set(value string) (err error) {
 	port, err := newPort(value)
 	if err != nil {
@@ -846,7 +842,13 @@ func (ports PortList) Set(value string) (err error) {
 	ports = append(ports, port)
 	return nil
 }
-
+func (ports PortList) String() string {
+	var s []string
+	for _, x  := range ports {
+		s = append(s, fmt.Sprintf("%v", x))
+	}
+	return fmt.Sprintf("%v", s)
+}
 // ListOpts type
 type ListOpts []string
 
