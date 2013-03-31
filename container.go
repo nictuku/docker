@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -44,17 +43,18 @@ type Container struct {
 }
 
 type Config struct {
-	Hostname   string
-	User       string
-	Memory     int64 // Memory limit (in bytes)
-	MemorySwap int64 // Total memory usage (memory + swap); set `-1' to disable swap
-	Detach     bool
-	Ports      []int
-	Tty        bool // Attach standard streams to a tty, including stdin if it is not closed.
-	OpenStdin  bool // Open stdin
-	Env        []string
-	Cmd        []string
-	Image      string // Name of the image as it was passed by the operator (eg. could be symbolic)
+	Hostname    string
+	User        string
+	Memory      int64 // Memory limit (in bytes)
+	MemorySwap  int64 // Total memory usage (memory + swap); set `-1' to disable swap
+	Detach      bool
+	Ports       []int // Old format.
+	MappedPorts []Port
+	Tty         bool // Attach standard streams to a tty, including stdin if it is not closed.
+	OpenStdin   bool // Open stdin
+	Env         []string
+	Cmd         []string
+	Image       string // Name of the image as it was passed by the operator (eg. could be symbolic)
 }
 
 func ParseRun(args []string, stdout io.Writer) (*Config, error) {
@@ -68,8 +68,7 @@ func ParseRun(args []string, stdout io.Writer) (*Config, error) {
 	flStdin := cmd.Bool("i", false, "Keep stdin open even if not attached")
 	flTty := cmd.Bool("t", false, "Allocate a pseudo-tty")
 	flMemory := cmd.Int64("m", 0, "Memory limit (in bytes)")
-	var flPorts ports
-
+	var flPorts PortList
 	cmd.Var(&flPorts, "p", "Map a network port to the container")
 	var flEnv ListOpts
 	cmd.Var(&flEnv, "e", "Set environment variables")
@@ -85,16 +84,17 @@ func ParseRun(args []string, stdout io.Writer) (*Config, error) {
 	if len(parsedArgs) > 1 {
 		runCmd = parsedArgs[1:]
 	}
+
 	config := &Config{
-		Ports:     flPorts,
-		User:      *flUser,
-		Tty:       *flTty,
-		OpenStdin: *flStdin,
-		Memory:    *flMemory,
-		Detach:    *flDetach,
-		Env:       flEnv,
-		Cmd:       runCmd,
-		Image:     image,
+		MappedPorts: flPorts,
+		User:        *flUser,
+		Tty:         *flTty,
+		OpenStdin:   *flStdin,
+		Memory:      *flMemory,
+		Detach:      *flDetach,
+		Env:         flEnv,
+		Cmd:         runCmd,
+		Image:       image,
 	}
 	return config, nil
 }
@@ -103,7 +103,7 @@ type NetworkSettings struct {
 	IpAddress   string
 	IpPrefixLen int
 	Gateway     string
-	PortMapping map[string]string
+	PortMapping map[string]Port
 }
 
 func (container *Container) Cmd() *exec.Cmd {
@@ -123,6 +123,11 @@ func (container *Container) FromDisk() error {
 	if err := json.Unmarshal(data, container); err != nil {
 		return err
 	}
+	for _, num := range container.Config.Ports {
+		container.Config.MappedPorts = append(container.Config.MappedPorts, Port{"tcp", num})
+	}
+	container.Config.Ports = []int{}
+
 	return nil
 }
 
@@ -336,13 +341,18 @@ func (container *Container) allocateNetwork() error {
 	if err != nil {
 		return err
 	}
-	container.NetworkSettings.PortMapping = make(map[string]string)
-	for _, port := range container.Config.Ports {
+	container.NetworkSettings.PortMapping = make(map[string]Port)
+	// Accept the older port spec format.
+	for _, num := range container.Config.Ports {
+		container.Config.MappedPorts = append(container.Config.MappedPorts, Port{"tcp", num})
+	}
+	container.Config.Ports = []int{}
+	for _, port := range container.Config.MappedPorts {
 		if extPort, err := iface.AllocatePort(port); err != nil {
 			iface.Release()
 			return err
 		} else {
-			container.NetworkSettings.PortMapping[strconv.Itoa(port)] = strconv.Itoa(extPort)
+			container.NetworkSettings.PortMapping[port.String()] = extPort
 		}
 	}
 	container.network = iface

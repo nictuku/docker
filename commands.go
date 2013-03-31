@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -317,11 +316,14 @@ func (srv *Server) CmdPort(stdin io.ReadCloser, stdout io.Writer, args ...string
 		return nil
 	}
 	name := cmd.Arg(0)
-	privatePort := cmd.Arg(1)
+	privatePort, err := parsePort(cmd.Arg(1))
+	if err != nil {
+		return err
+	}
 	if container := srv.runtime.Get(name); container == nil {
 		return fmt.Errorf("No such container: %s", name)
 	} else {
-		if frontend, exists := container.NetworkSettings.PortMapping[privatePort]; !exists {
+		if frontend, exists := container.NetworkSettings.PortMapping[privatePort.String()]; !exists {
 			return fmt.Errorf("No private port '%s' allocated on %s", privatePort, name)
 		} else {
 			fmt.Fprintln(stdout, frontend)
@@ -830,22 +832,6 @@ func (srv *Server) CmdAttach(stdin io.ReadCloser, stdout io.Writer, args ...stri
 	return nil
 }
 
-// Ports type - Used to parse multiple -p flags
-type ports []int
-
-func (p *ports) String() string {
-	return fmt.Sprint(*p)
-}
-
-func (p *ports) Set(value string) error {
-	port, err := strconv.Atoi(value)
-	if err != nil {
-		return fmt.Errorf("Invalid port: %v", value)
-	}
-	*p = append(*p, port)
-	return nil
-}
-
 // ListOpts type
 type ListOpts []string
 
@@ -855,6 +841,25 @@ func (opts *ListOpts) String() string {
 
 func (opts *ListOpts) Set(value string) error {
 	*opts = append(*opts, value)
+	return nil
+}
+
+// Ports type - Used to parse multiple -p flags with format FOO
+// parsePorts parses a port specification from the command-line in the formats
+// "[protocol/]port" or "[protocol:]port", where the protocol is optional and
+// defaults to "tcp". Examples: 8881, udp/8882, udp:8811.
+type PortList []Port
+
+func (ports PortList) String() string {
+	return fmt.Sprint(ports)
+}
+
+func (ports PortList) Set(value string) (err error) {
+	port, err := parsePort(value)
+	if err != nil {
+		return err
+	}
+	ports = append(ports, port)
 	return nil
 }
 
