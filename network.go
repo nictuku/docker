@@ -27,23 +27,28 @@ func (p Port) String() string {
 	return fmt.Sprintf("%v/%d", p.Proto, p.Num)
 }
 
-func parsePort(p string) (port Port, err error) {
+func newPort(p string) (Port, error) {
+	port, proto, err := parsePort(p)
+	return Port{proto, port}, err
+}
+
+func parsePort(p string) (port int, proto string, err error) {
 	s := strings.Split(p, "/")
 	switch len(s) {
 	case 0:
-		return Port{}, fmt.Errorf("Invalid port port (empty)")
+		return 0, "", fmt.Errorf("Invalid port port (empty)")
 	case 1:
 		// No proto provided, defaults to TCP.
-		port.Proto = "tcp"
-		port.Num, err = strconv.Atoi(s[0])
+		proto = "tcp"
+		port, err = strconv.Atoi(s[0])
 	case 2:
-		port.Proto = s[0]
-		port.Num, err = strconv.Atoi(s[1])
+		proto = s[0]
+		port, err = strconv.Atoi(s[1])
 	default:
 		err = fmt.Errorf("Invalid port format: %v", port)
 	}
 	if err != nil {
-		return Port{}, err
+		return 0, "", err
 	}
 	return
 }
@@ -135,11 +140,17 @@ func getIfaceAddr(name string) (net.Addr, error) {
 	return addrs4[0], nil
 }
 
-// Port mapper takes care of mapping external ports to containers by setting
-// up iptables rules.
-// It keeps track of all mappings and is able to unmap at will
+type Addr struct {
+	ip   net.IP
+	port int
+}
+
+// Port mapper takes care of mapping external ports to containers by setting up
+// iptables rules. There is one PortMapper for each transport protocol (tcp,
+// udp). It keeps track of all mappings and is able to unmap at will
 type PortMapper struct {
-	mapping map[Port]Port
+	proto   string
+	mapping map[int]Addr
 }
 
 func (mapper *PortMapper) cleanup() error {
@@ -148,7 +159,7 @@ func (mapper *PortMapper) cleanup() error {
 	iptables("-t", "nat", "-D", "OUTPUT", "-j", "DOCKER")
 	iptables("-t", "nat", "-F", "DOCKER")
 	iptables("-t", "nat", "-X", "DOCKER")
-	mapper.mapping = make(map[Port]Port)
+	mapper.mapping = make(map[int]Addr)
 	return nil
 }
 
@@ -165,12 +176,12 @@ func (mapper *PortMapper) setup() error {
 	return nil
 }
 
-func (mapper *PortMapper) iptablesForward(rule string, port Port, dest Port) error {
-	return iptables("-t", "nat", rule, "DOCKER", "-p", dest.Proto, "--dport", strconv.Itoa(port.Num),
-		"-j", "DNAT", "--to-destination", dest.String())
+func (mapper *PortMapper) iptablesForward(rule string, port int, dest Addr) error {
+	return iptables("-t", "nat", rule, "DOCKER", "-p", mapper.proto, "--dport", strconv.Itoa(port),
+		"-j", "DNAT", "--to-destination", net.JoinHostPort(dest.ip.String(), strconv.Itoa(dest.port)))
 }
 
-func (mapper *PortMapper) Map(port Port, dest Port) error {
+func (mapper *PortMapper) Map(port int, dest Addr) error {
 	if err := mapper.iptablesForward("-A", port, dest); err != nil {
 		return err
 	}
@@ -178,7 +189,7 @@ func (mapper *PortMapper) Map(port Port, dest Port) error {
 	return nil
 }
 
-func (mapper *PortMapper) Unmap(port Port) error {
+func (mapper *PortMapper) Unmap(port int) error {
 	dest, ok := mapper.mapping[port]
 	if !ok {
 		return errors.New("Port is not mapped")
@@ -190,8 +201,8 @@ func (mapper *PortMapper) Unmap(port Port) error {
 	return nil
 }
 
-func newPortMapper() (*PortMapper, error) {
-	mapper := &PortMapper{}
+func newPortMapper(proto string) (*PortMapper, error) {
+	mapper := &PortMapper{proto: proto}
 	if err := mapper.cleanup(); err != nil {
 		return nil, err
 	}
@@ -204,17 +215,17 @@ func newPortMapper() (*PortMapper, error) {
 // Port allocator: Atomatically allocate and release networking ports for a
 // specific protocol. Separate PortAllocators are needed for TCP, UDP, etc.
 type PortAllocator struct {
-	ports chan (Port)
+	ports chan (int)
 }
 
-func (alloc *PortAllocator) populate(start, end Port) {
-	alloc.ports = make(chan Port, end.Num-start.Num)
-	for port := start.Num; port < end.Num; port++ {
-		alloc.ports <- Port{start.Proto, port}
+func (alloc *PortAllocator) populate(start, end int) {
+	alloc.ports = make(chan int, end-start)
+	for port := start; port < end; port++ {
+		alloc.ports <- port
 	}
 }
 
-func (alloc *PortAllocator) Acquire() (port Port, err error) {
+func (alloc *PortAllocator) Acquire() (port int, err error) {
 	select {
 	case port = <-alloc.ports:
 		return port, nil
@@ -224,7 +235,7 @@ func (alloc *PortAllocator) Acquire() (port Port, err error) {
 	return port, nil
 }
 
-func (alloc *PortAllocator) Release(port Port) error {
+func (alloc *PortAllocator) Release(port int) error {
 	select {
 	case alloc.ports <- port:
 		return nil
@@ -234,7 +245,8 @@ func (alloc *PortAllocator) Release(port Port) error {
 	return nil
 }
 
-func newPortAllocator(start, end Port) (*PortAllocator, error) {
+func newPortAllocator(start, end int) (*PortAllocator, error) {
+
 	allocator := &PortAllocator{}
 	allocator.populate(start, end)
 	return allocator, nil
@@ -314,49 +326,71 @@ type NetworkInterface struct {
 }
 
 // Allocate an external port and map it to the interface
-func (iface *NetworkInterface) AllocatePort(port Port) (Port, error) {
-	portAllocator, err := iface.protoPortAllocator(port.Proto)
+func (iface *NetworkInterface) AllocatePort(proto string, port int) (int, error) {
+	portManager, err := iface.portManager(proto)
 	if err != nil {
-		return Port{}, err
+		return 0, err
 	}
-	extPort, err := portAllocator.Acquire()
+	extPort, err := portManager.Acquire()
 	if err != nil {
-		return Port{}, err
+		return 0, err
 	}
-	if err := iface.manager.portMapper.Map(extPort, port); err != nil {
-		portAllocator.Release(extPort)
-		return Port{}, err
+	if err := portManager.Map(extPort, Addr{ip: iface.IPNet.IP, port: port}); err != nil {
+		portManager.Release(extPort)
+		return 0, err
 	}
-	iface.extPorts = append(iface.extPorts, extPort)
+	iface.extPorts = append(iface.extPorts, Port{proto, extPort})
 	return extPort, nil
 }
 
-func (iface *NetworkInterface) protoPortAllocator(proto string) (*PortAllocator, error) {
+func (iface *NetworkInterface) portManager(proto string) (*PortManager, error) {
 	switch proto {
 	case "tcp":
-		return iface.manager.tcpPortAllocator, nil
+		return iface.manager.tcpManager, nil
 	case "udp":
-		return iface.manager.udpPortAllocator, nil
+		return iface.manager.udpManager, nil
 	}
-	return nil, fmt.Errorf("Can't find port allocator for unknown protocol %v", proto)
+	return nil, fmt.Errorf("Can't find port manager for unknown protocol %v", proto)
 }
 
 // Release: Network cleanup - release all resources
 func (iface *NetworkInterface) Release() error {
 	for _, port := range iface.extPorts {
-		if err := iface.manager.portMapper.Unmap(port); err != nil {
-			log.Printf("Unable to unmap port %v: %v", port, err)
-		}
-		portAllocator, err := iface.protoPortAllocator(port.Proto)
+		portManager, err := iface.portManager(port.Proto)
 		if err != nil {
 			return err
 		}
-		if err := portAllocator.Release(port); err != nil {
+		if err := portManager.Unmap(port.Num); err != nil {
+			log.Printf("Unable to unmap port %v: %v", port, err)
+		}
+		if err := portManager.Release(port.Num); err != nil {
 			log.Printf("Unable to release port %v: %v", port, err)
 		}
-
 	}
 	return iface.manager.ipAllocator.Release(iface.IPNet.IP)
+}
+
+func newPortManager(proto string) (*PortManager, error) {
+	portAllocator, err := newPortAllocator(
+		portRangeStart,
+		portRangeEnd,
+	)
+	if err != nil {
+		return nil, err
+	}
+	portMapper, err := newPortMapper(proto)
+	if err != nil {
+		return nil, err
+	}
+	return &PortManager{portAllocator, portMapper, proto}, nil
+}
+
+// PortManager allocates and maps ports for a particular protocol (e.g: tcp,
+// udp).
+type PortManager struct {
+	*PortAllocator
+	*PortMapper
+	proto string
 }
 
 // Network Manager manages a set of network interfaces
@@ -365,10 +399,9 @@ type NetworkManager struct {
 	bridgeIface   string
 	bridgeNetwork *net.IPNet
 
-	ipAllocator      *IPAllocator
-	tcpPortAllocator *PortAllocator
-	udpPortAllocator *PortAllocator
-	portMapper       *PortMapper
+	ipAllocator *IPAllocator
+	tcpManager  *PortManager
+	udpManager  *PortManager
 }
 
 // Allocate a network interface
@@ -396,37 +429,20 @@ func newNetworkManager(bridgeIface string) (*NetworkManager, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	proto := "tcp"
-	tcpPortAllocator, err := newPortAllocator(
-		Port{proto, portRangeStart},
-		Port{proto, portRangeEnd},
-	)
+	tcpManager, err := newPortManager("tcp")
 	if err != nil {
 		return nil, err
 	}
-
-	proto = "udp"
-	udpPortAllocator, err := newPortAllocator(
-		Port{proto, portRangeStart},
-		Port{proto, portRangeEnd},
-	)
+	udpManager, err := newPortManager("udp")
 	if err != nil {
 		return nil, err
 	}
-
-	portMapper, err := newPortMapper()
-	if err != nil {
-		return nil, err
-	}
-
 	manager := &NetworkManager{
-		bridgeIface:      bridgeIface,
-		bridgeNetwork:    network,
-		ipAllocator:      ipAllocator,
-		tcpPortAllocator: tcpPortAllocator,
-		udpPortAllocator: udpPortAllocator,
-		portMapper:       portMapper,
+		bridgeIface:   bridgeIface,
+		bridgeNetwork: network,
+		ipAllocator:   ipAllocator,
+		tcpManager:    tcpManager,
+		udpManager:    udpManager,
 	}
 	return manager, nil
 }

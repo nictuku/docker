@@ -316,14 +316,11 @@ func (srv *Server) CmdPort(stdin io.ReadCloser, stdout io.Writer, args ...string
 		return nil
 	}
 	name := cmd.Arg(0)
-	privatePort, err := parsePort(cmd.Arg(1))
-	if err != nil {
-		return err
-	}
+	privatePort := cmd.Arg(1)
 	if container := srv.runtime.Get(name); container == nil {
 		return fmt.Errorf("No such container: %s", name)
 	} else {
-		if frontend, exists := container.NetworkSettings.PortMapping[privatePort.String()]; !exists {
+		if frontend, exists := container.NetworkSettings.PortMapping[privatePort]; !exists {
 			return fmt.Errorf("No private port '%s' allocated on %s", privatePort, name)
 		} else {
 			fmt.Fprintln(stdout, frontend)
@@ -842,7 +839,7 @@ func (ports PortList) String() string {
 }
 
 func (ports PortList) Set(value string) (err error) {
-	port, err := parsePort(value)
+	port, err := newPort(value)
 	if err != nil {
 		return err
 	}

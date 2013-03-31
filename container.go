@@ -349,13 +349,14 @@ func (container *Container) allocateNetwork() error {
 		return err
 	}
 	container.NetworkSettings.PortMapping = make(map[string]string)
-	//	container.Config.Update()
+	container.Config.Update()
 	for _, port := range container.Config.PrivatePorts {
-		if extPort, err := iface.AllocatePort(port); err != nil {
+		if extPort, err := iface.AllocatePort(port.Proto, port.Num); err != nil {
 			iface.Release()
 			return err
 		} else {
-			container.NetworkSettings.PortMapping[port.String()] = extPort.String()
+			formattedExtPort := Port{port.Proto, extPort}.String()
+			container.NetworkSettings.PortMapping[port.String()] = formattedExtPort
 		}
 	}
 	container.network = iface
